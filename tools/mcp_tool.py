@@ -2028,24 +2028,51 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             #
             # MCP CallToolResult content is a list of blocks. Each block is
             # one of TextContent / ImageContent / EmbeddedResource (per the
-            # MCP spec).  Hermes historically only forwarded TextContent, so
-            # tools that returned screenshots (e.g. cua_screenshot via the
-            # AgentHLE CUA bridge) had their PNG payload silently dropped.
+            # MCP spec).  Upstream forwarded only TextContent; we extend
+            # that to ImageContent by **persisting the image to disk** and
+            # returning a path the agent can vision_analyze / read_file.
             #
-            # Embed ImageContent blocks as standard data URLs so downstream
-            # consumers (TUI renderers, trajectory parsers, vision-capable
-            # models) can recover the image without changing the on-the-wire
-            # JSON envelope.
+            # We deliberately do NOT embed the base64 data URL directly into
+            # the text result — a single multi-MB screenshot makes every
+            # subsequent API call carry the full payload in conversation
+            # history (provider context windows + tokenizer cost), which
+            # caused reactive compaction to fail in long-running agent loops.
+            # On-disk handoff keeps the model's context lean while still
+            # giving it access to the image when it explicitly asks.
+            import os, uuid, base64 as _b64, time as _time
             parts: List[str] = []
+            saved_image_paths: List[str] = []
+            image_dir = os.path.join(
+                os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes")),
+                "mcp_images",
+            )
             for block in (result.content or []):
                 if hasattr(block, "text") and getattr(block, "text", None) is not None:
                     parts.append(block.text)
                     continue
-                # ImageContent has .data (base64 str) and .mimeType (e.g. "image/png").
                 data = getattr(block, "data", None)
                 mime = getattr(block, "mimeType", None) or getattr(block, "mime_type", None)
                 if isinstance(data, str) and isinstance(mime, str) and mime.startswith("image/"):
-                    parts.append(f"data:{mime};base64,{data}")
+                    try:
+                        os.makedirs(image_dir, exist_ok=True)
+                        ext = mime.rsplit("/", 1)[-1].split("+")[0] or "bin"
+                        fname = f"mcp_{server_name}_{tool_name}_{int(_time.time()*1000)}_{uuid.uuid4().hex[:8]}.{ext}"
+                        fpath = os.path.join(image_dir, fname)
+                        with open(fpath, "wb") as f:
+                            f.write(_b64.b64decode(data))
+                        saved_image_paths.append(fpath)
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP %s/%s: failed to persist ImageContent (%s); "
+                            "skipping image instead of inlining base64",
+                            server_name, tool_name, exc,
+                        )
+            if saved_image_paths:
+                lines = [f"[image saved to {p}]" for p in saved_image_paths]
+                if parts:
+                    parts.append("\n".join(lines))
+                else:
+                    parts.extend(lines)
             text_result = "\n".join(parts) if parts else ""
 
             # Combine content + structuredContent when both are present.
