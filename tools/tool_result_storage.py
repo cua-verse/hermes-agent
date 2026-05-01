@@ -191,8 +191,17 @@ def enforce_turn_budget(
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
-            candidates.append((i, size))
+        if PERSISTED_OUTPUT_TAG in content:
+            continue
+        # Tool results that embed inline image data URLs (most commonly
+        # base64-encoded screenshots from MCP tools registered with
+        # max_result_size_chars=inf) must be preserved verbatim — the agent
+        # and downstream trajectory parsers depend on the b64 payload being
+        # intact and self-contained.  Truncating these mid-payload corrupts
+        # the data URL and defeats the per-tool unbounded threshold.
+        if "data:image/" in content:
+            continue
+        candidates.append((i, size))
 
     if total_size <= config.turn_budget:
         return tool_messages
