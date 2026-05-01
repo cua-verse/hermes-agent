@@ -2024,11 +2024,28 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 }, ensure_ascii=False)
 
-            # Collect text from content blocks
+            # Collect text + image content blocks.
+            #
+            # MCP CallToolResult content is a list of blocks. Each block is
+            # one of TextContent / ImageContent / EmbeddedResource (per the
+            # MCP spec).  Hermes historically only forwarded TextContent, so
+            # tools that returned screenshots (e.g. cua_screenshot via the
+            # AgentHLE CUA bridge) had their PNG payload silently dropped.
+            #
+            # Embed ImageContent blocks as standard data URLs so downstream
+            # consumers (TUI renderers, trajectory parsers, vision-capable
+            # models) can recover the image without changing the on-the-wire
+            # JSON envelope.
             parts: List[str] = []
             for block in (result.content or []):
-                if hasattr(block, "text"):
+                if hasattr(block, "text") and getattr(block, "text", None) is not None:
                     parts.append(block.text)
+                    continue
+                # ImageContent has .data (base64 str) and .mimeType (e.g. "image/png").
+                data = getattr(block, "data", None)
+                mime = getattr(block, "mimeType", None) or getattr(block, "mime_type", None)
+                if isinstance(data, str) and isinstance(mime, str) and mime.startswith("image/"):
+                    parts.append(f"data:{mime};base64,{data}")
             text_result = "\n".join(parts) if parts else ""
 
             # Combine content + structuredContent when both are present.
