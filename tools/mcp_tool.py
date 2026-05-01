@@ -2735,6 +2735,13 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            # MCP tool authors choose the result size deliberately (e.g. a
+            # screenshot tool returns a multi-MB base64 PNG).  Truncating at
+            # the 100k default would corrupt structured payloads for any
+            # caller that doesn't know to slice on text-block boundaries.
+            # Let the agent's own context compression handle large MCP
+            # outputs the same way it handles read_file (also unbounded).
+            max_result_size_chars=float("inf"),
         )
         registered_names.append(tool_name_prefixed)
 
