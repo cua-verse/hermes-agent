@@ -7937,7 +7937,128 @@ class AIAgent:
             cache[mode] = t
         return t
 
+    def _expand_tool_image_followups(self, api_messages: list) -> list:
+        """Expand MCP tool results that carry inline image metadata.
+
+        ``mcp_tool._make_tool_handler`` saves any ImageContent block from a
+        tool result to ``~/.hermes/mcp_images/`` and emits a JSON payload
+        like ``{"result": "...", "_hermes_inline_images": [{"path": ..., "mime": ...}, ...]}``
+        as the ``tool`` role content.  Sonnet, Gemini, and other vision
+        models can't see images sent as a tool-role string, so we expand
+        each marker into:
+
+          1. The original tool message with ``_hermes_inline_images``
+             stripped (model still sees the text answer).
+          2. A new ``user`` message inserted right after the matching
+             tool batch, carrying one OpenAI-style ``image_url`` content
+             part per saved image (data URL with the b64-encoded bytes).
+
+        The downstream provider adapters (Anthropic / Bedrock / Codex /
+        Gemini / chat.completions) already translate ``image_url`` parts
+        into the vendor-specific multimodal format, so a single expansion
+        here covers every wire we support.
+
+        Mutates a shallow copy of ``api_messages``; original list and its
+        message dicts are not modified.  Idempotent: a message that has
+        already been expanded (no marker present) passes through.
+        """
+        # Fast exit when no tool message carries our marker.
+        marker = "_hermes_inline_images"
+        has_marker = False
+        for msg in api_messages:
+            if not (isinstance(msg, dict) and msg.get("role") == "tool"):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and marker in content:
+                has_marker = True
+                break
+        if not has_marker:
+            return api_messages
+
+        try:
+            from tools.vision_tools import _resize_image_for_vision  # type: ignore
+        except Exception:
+            _resize_image_for_vision = None  # noqa: N816
+
+        def _build_image_part(meta: dict) -> Optional[dict]:
+            path = (meta or {}).get("path")
+            mime = (meta or {}).get("mime") or "image/png"
+            if not path or not isinstance(path, str):
+                return None
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+            except Exception as exc:
+                logger.warning("inline-image expansion: read %s failed (%s)", path, exc)
+                return None
+            import base64 as _b64
+            data_url = f"data:{mime};base64,{_b64.b64encode(raw).decode('ascii')}"
+            return {"type": "image_url", "image_url": {"url": data_url}}
+
+        expanded: list = []
+        # ``api_messages`` may interleave tool messages from a single
+        # parallel-batch call.  Group consecutive tool messages so all
+        # follow-up images land in one user message after the batch.
+        i = 0
+        msgs = list(api_messages)
+        while i < len(msgs):
+            msg = msgs[i]
+            if not (isinstance(msg, dict) and msg.get("role") == "tool"):
+                expanded.append(msg)
+                i += 1
+                continue
+            # Walk the contiguous tool-message run.
+            tool_run_end = i
+            collected_image_parts: list = []
+            while (
+                tool_run_end < len(msgs)
+                and isinstance(msgs[tool_run_end], dict)
+                and msgs[tool_run_end].get("role") == "tool"
+            ):
+                tmsg = dict(msgs[tool_run_end])  # shallow copy so we can mutate
+                content = tmsg.get("content")
+                if isinstance(content, str) and marker in content:
+                    try:
+                        parsed = json.loads(content)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict) and isinstance(parsed.get(marker), list):
+                        for img_meta in parsed[marker]:
+                            part = _build_image_part(img_meta)
+                            if part is not None:
+                                collected_image_parts.append(part)
+                        # Strip the marker from the wire payload.
+                        parsed.pop(marker, None)
+                        tmsg["content"] = json.dumps(parsed, ensure_ascii=False)
+                expanded.append(tmsg)
+                tool_run_end += 1
+            # Inject a follow-up user message with the collected images,
+            # if any.  Caption explains the provenance so the model
+            # doesn't think the user manually attached them.
+            if collected_image_parts:
+                caption = (
+                    "(Above tool calls returned images; attached here for direct "
+                    "visual inspection. Saved on disk for later access.)"
+                )
+                expanded.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": caption},
+                            *collected_image_parts,
+                        ],
+                    }
+                )
+            i = tool_run_end
+        return expanded
+
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+        # First, expand MCP tool results that carry inline image content
+        # into a follow-up user message with image_url parts. The
+        # downstream Anthropic adapter / non-vision shrinker / shrink-on-
+        # error helpers all consume image_url parts uniformly.
+        api_messages = self._expand_tool_image_followups(api_messages)
+
         # Fast exit when no message carries image content at all.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -8258,6 +8379,9 @@ class AIAgent:
                 )
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
+            # Expand MCP tool results carrying inline images into image_url
+            # user follow-ups before non-vision shrinking runs.
+            api_messages = self._expand_tool_image_followups(api_messages)
             _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
             return _ct.build_kwargs(
                 model=self.model,
@@ -8341,6 +8465,10 @@ class AIAgent:
         _ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
         if _ephemeral_out is not None:
             self._ephemeral_max_output_tokens = None
+
+        # Expand MCP tool results carrying inline images into image_url
+        # user follow-ups (does nothing when no tool result has the marker).
+        api_messages = self._expand_tool_image_followups(api_messages)
 
         # Strip image parts for non-vision models (no-op when vision-capable).
         _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)

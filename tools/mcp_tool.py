@@ -2075,19 +2075,35 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     parts.extend(lines)
             text_result = "\n".join(parts) if parts else ""
 
+            # Embed an explicit signal that the agent loop can pick up to
+            # inject these images as a multimodal `image_url` follow-up
+            # user message.  The agent expander (run_agent.py
+            # ``_expand_tool_image_followups``) consumes this marker and
+            # strips it before the message ever reaches the provider, so
+            # the wire payload stays standard.
+            inline_image_meta = [
+                {"path": p, "mime": "image/png" if p.endswith(".png") else
+                 ("image/jpeg" if p.endswith((".jpg", ".jpeg")) else
+                  ("image/webp" if p.endswith(".webp") else "application/octet-stream"))}
+                for p in saved_image_paths
+            ]
+
             # Combine content + structuredContent when both are present.
             # MCP spec: content is model-oriented (text), structuredContent
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
             structured = getattr(result, "structuredContent", None)
             if structured is not None:
-                if text_result:
-                    return json.dumps({
-                        "result": text_result,
-                        "structuredContent": structured,
-                    }, ensure_ascii=False)
-                return json.dumps({"result": structured}, ensure_ascii=False)
-            return json.dumps({"result": text_result}, ensure_ascii=False)
+                payload: dict[str, Any] = (
+                    {"result": text_result, "structuredContent": structured}
+                    if text_result
+                    else {"result": structured}
+                )
+            else:
+                payload = {"result": text_result}
+            if inline_image_meta:
+                payload["_hermes_inline_images"] = inline_image_meta
+            return json.dumps(payload, ensure_ascii=False)
 
         def _call_once():
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
